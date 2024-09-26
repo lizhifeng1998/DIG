@@ -7,21 +7,25 @@ from torch_geometric.data import DataLoader
 import numpy as np
 from torch.autograd import grad
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 from tqdm import tqdm
+
+import shutil
+
 
 class run():
     r"""
     The base script for running different 3DGN methods.
     """
+
     def __init__(self):
         pass
-        
-    def run(self, device, train_dataset, valid_dataset, test_dataset, model, loss_func, evaluation, epochs=500, batch_size=32, vt_batch_size=32, lr=0.0005, lr_decay_factor=0.5, lr_decay_step_size=50, weight_decay=0, 
-        energy_and_force=False, p=100, save_dir='', log_dir=''):
+
+    def run(self, device, train_dataset, valid_dataset, test_dataset, model, loss_func, evaluation, epochs=500, batch_size=32, vt_batch_size=32, lr=0.0005, lr_decay_factor=0.5, lr_decay_step_size=50, weight_decay=0,
+            energy_and_force=False, p=100, save_dir='', log_dir='', test_again=False, emin=0, nets=1, notest=False, min_lr=1e-6, patience=-1,):
         r"""
         The run script for training and validation.
-        
+
         Args:
             device (torch.device): Device for computation.
             train_dataset: Training data.
@@ -41,21 +45,50 @@ class run():
             p (int, optinal): The forces’ weight for a joint loss of forces and conserved energy during training. (default: :obj:`100`)
             save_dir (str, optinal): The path to save trained models. If set to :obj:`''`, will not save the model. (default: :obj:`''`)
             log_dir (str, optinal): The path to save log files. If set to :obj:`''`, will not save the log files. (default: :obj:`''`)
-        
-        """        
+
+        """
 
         model = model.to(device)
         num_params = sum(p.numel() for p in model.parameters())
         print(f'#Params: {num_params}')
         optimizer = Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = StepLR(optimizer, step_size=lr_decay_step_size, gamma=lr_decay_factor)
+        if patience < 0:
+            scheduler = StepLR(optimizer, step_size=lr_decay_step_size, gamma=lr_decay_factor)
+        else:
+            scheduler = ReduceLROnPlateau(optimizer, patience=patience, factor=lr_decay_factor, min_lr=min_lr)
 
         train_loader = DataLoader(train_dataset, batch_size, shuffle=True)
         valid_loader = DataLoader(valid_dataset, vt_batch_size, shuffle=False)
-        test_loader = DataLoader(test_dataset, vt_batch_size, shuffle=False)
+        if not notest:
+            test_loader = DataLoader(test_dataset, vt_batch_size, shuffle=False)
         best_valid = float('inf')
         best_test = float('inf')
-            
+
+        if test_again:
+            if not os.path.exists(save_dir+'/valid_checkpoint.pt'):
+                print('valid_checkpoint.pt not exists')
+                exit()
+            if notest:
+                print('notest')
+                exit()
+            save_dict = torch.load(save_dir+'/valid_checkpoint.pt')
+            model.load_state_dict(save_dict['model_state_dict'])
+            print('\n\nTraining...', flush=True)
+            train_mae = self.val(model, train_loader,
+                                 energy_and_force, p, evaluation, device, ofile=save_dir+'/test_again.csv', emin=emin)
+            print('\n\nEvaluating...', flush=True)
+            valid_mae = self.val(model, valid_loader,
+                                 energy_and_force, p, evaluation, device, ofile=save_dir+'/test_again.csv', emin=emin)
+            print('\n\nTesting...', flush=True)
+            test_mae = self.val(model, test_loader,
+                                energy_and_force, p, evaluation, device, ofile=save_dir+'/test_again.csv', emin=emin)
+            print()
+            print({'Train': train_mae, 'Validation': valid_mae, 'Test': test_mae})
+            return
+
+        if nets > 1:
+            best_valids = [float('inf') for i in range(nets)]
+
         if save_dir != '':
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)
@@ -63,47 +96,79 @@ class run():
             if not os.path.exists(log_dir):
                 os.makedirs(log_dir)
             writer = SummaryWriter(log_dir=log_dir)
-        
+
         for epoch in range(1, epochs + 1):
             print("\n=====Epoch {}".format(epoch), flush=True)
-            
+
             print('\nTraining...', flush=True)
-            train_mae = self.train(model, optimizer, train_loader, energy_and_force, p, loss_func, device)
+            train_mae = self.train(
+                model, optimizer, train_loader, energy_and_force, p, loss_func, device)
 
             print('\n\nEvaluating...', flush=True)
-            valid_mae = self.val(model, valid_loader, energy_and_force, p, evaluation, device)
+            valid_mae = self.val(model, valid_loader,
+                                 energy_and_force, p, evaluation, device)
 
             print('\n\nTesting...', flush=True)
-            test_mae = self.val(model, test_loader, energy_and_force, p, evaluation, device)
+            if not notest:
+                test_mae = self.val(model, test_loader,
+                                energy_and_force, p, evaluation, device)
 
             print()
-            print({'Train': train_mae, 'Validation': valid_mae, 'Test': test_mae})
+            if not notest:
+                print({'Train': train_mae, 'Validation': valid_mae, 'Test': test_mae})
+            else:print({'Train': train_mae, 'Validation': valid_mae})
 
             if log_dir != '':
                 writer.add_scalar('train_mae', train_mae, epoch)
                 writer.add_scalar('valid_mae', valid_mae, epoch)
-                writer.add_scalar('test_mae', test_mae, epoch)
-            
-            if valid_mae < best_valid:
+                if not notest:
+                    writer.add_scalar('test_mae', test_mae, epoch)
+
+            if nets > 1:
+                for i in range(nets):
+                    if valid_mae < best_valids[i]:
+                        for j in range(i,nets-1):
+                            best_valids[nets-j+i-1] = best_valids[nets-j+i-2]
+                            if not os.path.exists(os.path.join(save_dir,'valid_checkpoint.pt'+str(nets-j+i-2))):
+                                continue
+                            shutil.move(os.path.join(save_dir,'valid_checkpoint.pt'+str(nets-j+i-2)), os.path.join(save_dir,'valid_checkpoint.pt'+str(nets-j+i-1)))
+                        best_valids[i] = valid_mae
+                        if save_dir != '':
+                            print('Saving checkpoint...')
+                            checkpoint = {'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(
+                                ), 'scheduler_state_dict': scheduler.state_dict(), 'best_valid_mae': best_valids[i], 'num_params': num_params}
+                            torch.save(checkpoint, os.path.join(
+                                save_dir, 'valid_checkpoint.pt'+str(i)))
+                        best_valid = best_valids[i]
+                        break
+
+            if nets == 1 and valid_mae < best_valid:
                 best_valid = valid_mae
-                best_test = test_mae
+                if not notest:
+                    best_test = test_mae
                 if save_dir != '':
                     print('Saving checkpoint...')
-                    checkpoint = {'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'best_valid_mae': best_valid, 'num_params': num_params}
-                    torch.save(checkpoint, os.path.join(save_dir, 'valid_checkpoint.pt'))
+                    checkpoint = {'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(
+                    ), 'scheduler_state_dict': scheduler.state_dict(), 'best_valid_mae': best_valid, 'num_params': num_params}
+                    torch.save(checkpoint, os.path.join(
+                        save_dir, 'valid_checkpoint.pt'))
 
-            scheduler.step()
+            if patience < 0:
+                scheduler.step()
+            else:
+                scheduler.step(valid_mae)
 
         print(f'Best validation MAE so far: {best_valid}')
-        print(f'Test MAE when got best validation result: {best_test}')
-        
+        if not notest:
+            print(f'Test MAE when got best validation result: {best_test}')
+
         if log_dir != '':
             writer.close()
 
     def train(self, model, optimizer, train_loader, energy_and_force, p, loss_func, device):
         r"""
         The script for training.
-        
+
         Args:
             model: Which 3DGN model to use. Should be one of the SchNet, DimeNetPP, and SphereNet.
             optimizer (Optimizer): Pytorch optimizer for trainable parameters in training.
@@ -114,8 +179,8 @@ class run():
             device (torch.device): The device where the model is deployed.
 
         :rtype: Traning loss. ( :obj:`mae`)
-        
-        """   
+
+        """
         model.train()
         loss_accum = 0
         for step, batch_data in enumerate(tqdm(train_loader)):
@@ -123,7 +188,8 @@ class run():
             batch_data = batch_data.to(device)
             out = model(batch_data)
             if energy_and_force:
-                force = -grad(outputs=out, inputs=batch_data.pos, grad_outputs=torch.ones_like(out),create_graph=True,retain_graph=True)[0]
+                force = -grad(outputs=out, inputs=batch_data.pos, grad_outputs=torch.ones_like(
+                    out), create_graph=True, retain_graph=True)[0]
                 e_loss = loss_func(out, batch_data.y.unsqueeze(1))
                 f_loss = loss_func(force, batch_data.force)
                 loss = e_loss + p * f_loss
@@ -134,10 +200,10 @@ class run():
             loss_accum += loss.detach().cpu().item()
         return loss_accum / (step + 1)
 
-    def val(self, model, data_loader, energy_and_force, p, evaluation, device):
+    def val(self, model, data_loader, energy_and_force, p, evaluation, device, ofile=None, emin=0):
         r"""
         The script for validation/test.
-        
+
         Args:
             model: Which 3DGN model to use. Should be one of the SchNet, DimeNetPP, and SphereNet.
             data_loader (Dataloader): Dataloader for validation or test.
@@ -147,8 +213,8 @@ class run():
             device (torch.device, optional): The device where the model is deployed.
 
         :rtype: Evaluation result. ( :obj:`mae`)
-        
-        """   
+
+        """
         model.eval()
 
         preds = torch.Tensor([]).to(device)
@@ -157,14 +223,16 @@ class run():
         if energy_and_force:
             preds_force = torch.Tensor([]).to(device)
             targets_force = torch.Tensor([]).to(device)
-        
+
         for step, batch_data in enumerate(tqdm(data_loader)):
             batch_data = batch_data.to(device)
             out = model(batch_data)
             if energy_and_force:
-                force = -grad(outputs=out, inputs=batch_data.pos, grad_outputs=torch.ones_like(out),create_graph=True,retain_graph=True)[0]
-                preds_force = torch.cat([preds_force,force.detach_()], dim=0)
-                targets_force = torch.cat([targets_force,batch_data.force], dim=0)
+                force = -grad(outputs=out, inputs=batch_data.pos, grad_outputs=torch.ones_like(
+                    out), create_graph=True, retain_graph=True)[0]
+                preds_force = torch.cat([preds_force, force.detach_()], dim=0)
+                targets_force = torch.cat(
+                    [targets_force, batch_data.force], dim=0)
             preds = torch.cat([preds, out.detach_()], dim=0)
             targets = torch.cat([targets, batch_data.y.unsqueeze(1)], dim=0)
 
@@ -176,5 +244,11 @@ class run():
             force_mae = evaluation.eval(input_dict_force)['mae']
             print({'Energy MAE': energy_mae, 'Force MAE': force_mae})
             return energy_mae + p * force_mae
+
+        if ofile is not None:
+            with open(ofile, 'a') as f:
+                for target, pred in zip(targets.detach().cpu(), preds.detach().cpu()):
+                    f.write(str(target.item()-emin)+',' +
+                            str(pred.item()-emin)+'\n')
 
         return evaluation.eval(input_dict)['mae']
